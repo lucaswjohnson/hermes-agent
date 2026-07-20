@@ -28,6 +28,7 @@ from pathlib import Path
 import tempfile
 from unittest.mock import MagicMock, patch
 
+from agent.tool_executor import _current_user_turn_tool_messages
 from agent.tool_dispatch_helpers import make_tool_result_message
 from run_agent import AIAgent
 
@@ -250,3 +251,104 @@ def test_execute_tool_calls_concurrent_flushes_each_tool_result_in_order():
     # production flush call breaks one of these assertions.
     assert flushed_tool_ids == ["c1", "c2"]
     assert flush_lengths == [1, 2]
+
+
+# ---------------------------------------------------------------------------
+# Contract 4: the aggregate tool-result budget covers the whole user turn,
+# not only the latest assistant tool-call batch. A long agent loop commonly
+# emits one tool per model iteration; budgeting each one-item batch separately
+# lets hundreds of sub-threshold results accumulate until compression fires.
+# ---------------------------------------------------------------------------
+def test_sequential_tool_budget_spans_multiple_assistant_batches_in_one_user_turn():
+    agent = _make_agent()
+    messages: list = [{"role": "user", "content": "do the long task"}]
+
+    def _large_but_subthreshold_result(*_args, **_kwargs):
+        # Below the 100K per-result threshold, but three batches total 270K,
+        # which must exceed the 200K aggregate budget for one user turn.
+        return "x" * 90_000
+
+    agent._flush_messages_to_session_db = MagicMock()
+
+    with patch("run_agent.handle_function_call", side_effect=_large_but_subthreshold_result):
+        for i in range(3):
+            tool_call = _mock_tool_call(call_id=f"c{i}")
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": tool_call.id,
+                            "type": "function",
+                            "function": {"name": tool_call.function.name, "arguments": "{}"},
+                        }
+                    ],
+                }
+            )
+            assistant_message = SimpleNamespace(content="", tool_calls=[tool_call])
+            agent._execute_tool_calls_sequential(assistant_message, messages, "task-1")
+
+    current_turn_tools = [m for m in messages if m.get("role") == "tool"]
+    assert len(current_turn_tools) == 3
+    assert sum(len(m["content"]) for m in current_turn_tools) <= 200_000
+    assert any("Truncated: tool response was" in m["content"] for m in current_turn_tools)
+
+
+def test_concurrent_tool_budget_spans_multiple_assistant_batches_in_one_user_turn():
+    agent = _make_agent()
+    messages: list = [{"role": "user", "content": "do the long task"}]
+
+    def _large_but_subthreshold_result(*_args, **_kwargs):
+        return "x" * 90_000
+
+    agent._flush_messages_to_session_db = MagicMock()
+
+    with patch.object(agent, "_invoke_tool", side_effect=_large_but_subthreshold_result):
+        for i in range(3):
+            tool_call = _mock_tool_call(call_id=f"c{i}")
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": tool_call.id,
+                            "type": "function",
+                            "function": {"name": tool_call.function.name, "arguments": "{}"},
+                        }
+                    ],
+                }
+            )
+            assistant_message = SimpleNamespace(content="", tool_calls=[tool_call])
+            agent._execute_tool_calls_concurrent(assistant_message, messages, "task-1")
+
+    current_turn_tools = [m for m in messages if m.get("role") == "tool"]
+    assert len(current_turn_tools) == 3
+    assert sum(len(m["content"]) for m in current_turn_tools) <= 200_000
+    assert any("Truncated: tool response was" in m["content"] for m in current_turn_tools)
+
+
+def test_current_user_turn_tool_selection_preserves_prior_turn_and_message_identity():
+    prior_tool = {"role": "tool", "tool_call_id": "prior", "content": "prior result"}
+    current_tool_1 = {"role": "tool", "tool_call_id": "current-1", "content": "first"}
+    current_tool_2 = {"role": "tool", "tool_call_id": "current-2", "content": "second"}
+    messages = [
+        {"role": "user", "content": "completed request"},
+        prior_tool,
+        {"role": "assistant", "content": "completed response"},
+        {"role": "user", "content": "current request"},
+        {"role": "assistant", "content": "", "tool_calls": []},
+        current_tool_1,
+        {"role": "assistant", "content": "continuing"},
+        current_tool_2,
+    ]
+
+    selected = _current_user_turn_tool_messages(messages)
+
+    assert selected == [current_tool_1, current_tool_2]
+    assert selected[0] is current_tool_1
+    assert selected[1] is current_tool_2
+    selected[0]["content"] = "mutated in place"
+    assert current_tool_1["content"] == "mutated in place"
+    assert prior_tool["content"] == "prior result"

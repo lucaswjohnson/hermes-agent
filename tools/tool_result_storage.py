@@ -15,8 +15,8 @@ Defense against context-window overflow operates at three levels:
    file path reference. The model can read_file to access the full output
    on any backend.
 
-3. **Per-turn aggregate budget** (enforce_turn_budget): After all tool
-   results in a single assistant turn are collected, if the total exceeds
+3. **Per-user-turn aggregate budget** (enforce_turn_budget): As tool results
+   accumulate across assistant batches for one user request, if the total exceeds
    MAX_TURN_BUDGET_CHARS (200K), the largest non-persisted results are
    spilled to disk until the aggregate is under budget. This catches cases
    where many medium-sized results combine to overflow context.
@@ -205,7 +205,7 @@ def enforce_turn_budget(
     env=None,
     config: BudgetConfig = DEFAULT_BUDGET,
 ) -> list[dict]:
-    """Layer 3: enforce aggregate budget across all tool results in a turn.
+    """Layer 3: enforce aggregate budget across the supplied tool results.
 
     If total chars exceed budget, persist the largest non-persisted results
     first (via sandbox write) until under budget. Already-persisted results

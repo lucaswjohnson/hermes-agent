@@ -24,8 +24,8 @@ class BudgetConfig:
     """Immutable budget constants for the 3-layer tool result persistence system.
 
     Layer 2 (per-result): resolve_threshold(tool_name) -> threshold in chars.
-    Layer 3 (per-turn):   turn_budget -> aggregate char budget across all tool
-                          results in a single assistant turn.
+    Layer 3 (user turn):  turn_budget -> aggregate char budget across all tool
+                          results produced for one user request.
     Preview:              preview_size -> inline snippet size after persistence.
     """
 

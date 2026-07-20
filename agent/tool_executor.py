@@ -68,6 +68,27 @@ def _budget_for_agent(agent) -> BudgetConfig:
     except Exception:
         return DEFAULT_BUDGET
 
+
+def _current_user_turn_tool_messages(messages: list) -> list[dict]:
+    """Return mutable tool-message references since the latest user message.
+
+    A single user request can span many assistant(tool_calls) batches. Budgeting
+    only the newest batch lets individually-small results accumulate without
+    bound until context compression fires. Keep the aggregate budget scoped to
+    the current user turn so prior completed turns remain stable.
+    """
+    start = 0
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if isinstance(message, dict) and message.get("role") == "user":
+            start = index + 1
+            break
+    return [
+        message
+        for message in messages[start:]
+        if isinstance(message, dict) and message.get("role") == "tool"
+    ]
+
 # Maximum number of concurrent worker threads for parallel tool execution.
 # Mirrors the constant in ``run_agent`` for tests/imports that look here.
 _MAX_TOOL_WORKERS = 8
@@ -1010,10 +1031,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # result so the steer lands as early as possible.
         agent._apply_pending_steer_to_tool_results(messages, 1)
 
-    # ── Per-turn aggregate budget enforcement ─────────────────────────
+    # ── Per-user-turn aggregate budget enforcement ────────────────────
     num_tools = len(parsed_calls)
     if finalize and num_tools > 0:
-        turn_tool_msgs = messages[-num_tools:]
+        turn_tool_msgs = _current_user_turn_tool_messages(messages)
         enforce_turn_budget(turn_tool_msgs, env=get_active_env(effective_task_id), config=_tool_budget)
 
     # ── /steer injection ──────────────────────────────────────────────
@@ -1725,10 +1746,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         if agent.tool_delay > 0 and i < len(assistant_message.tool_calls):
             time.sleep(agent.tool_delay)
 
-    # ── Per-turn aggregate budget enforcement ─────────────────────────
+    # ── Per-user-turn aggregate budget enforcement ────────────────────
     num_tools_seq = len(assistant_message.tool_calls)
     if finalize and num_tools_seq > 0:
-        enforce_turn_budget(messages[-num_tools_seq:], env=get_active_env(effective_task_id), config=_tool_budget)
+        turn_tool_msgs = _current_user_turn_tool_messages(messages)
+        enforce_turn_budget(turn_tool_msgs, env=get_active_env(effective_task_id), config=_tool_budget)
 
     # ── /steer injection ──────────────────────────────────────────────
     # See _execute_tool_calls_parallel for the rationale. Same hook,
