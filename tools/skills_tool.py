@@ -69,6 +69,7 @@ Usage:
 import json
 import logging
 import time
+import hashlib
 
 from hermes_constants import get_hermes_home, display_hermes_home
 import os
@@ -101,6 +102,49 @@ _SKILLS_CACHE: dict = {}          # {cache_key: (signature, timestamp, skills_li
 _SKILLS_CACHE_TTL_SECONDS = 30.0
 _SKILLS_CACHE_KEY_DISABLED = "with_disabled"
 _SKILLS_CACHE_KEY_FILTERED = "filtered"
+
+# Record revisions injected into a specific *active context generation*, not a
+# process-global session. Compression/rollover changes that generation, so a
+# skill is automatically re-emitted when its previous tool result may no longer
+# exist in model context. Callers without a context id deliberately do not
+# deduplicate: there is no safe proof that they share context.
+_LOADED_SKILL_REVISIONS: dict[str, set[tuple[str, str, str]]] = {}
+_LOADED_SKILL_CONTEXT_LIMIT = 256
+
+
+def _skill_revision(content: str) -> str:
+    """Stable short revision ID for a rendered skill payload."""
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()[:12]
+
+
+def _already_loaded_in_context(
+    context_id: str | None,
+    skill_name: str,
+    revision: str,
+    mode: str,
+    *,
+    reload: bool,
+) -> bool:
+    """Record an injection in one active context generation.
+
+    ``context_id`` is runtime-owned (``session_id:context_generation``). A
+    compaction or rollover must mint a new value before dispatch, preventing a
+    stale process cache from suppressing instructions absent from the model's
+    new context. ``reload`` remains the explicit same-context escape hatch.
+    """
+    if not context_id or reload:
+        return False
+    key = (skill_name, revision, mode)
+    loaded = _LOADED_SKILL_REVISIONS.setdefault(context_id, set())
+    if key in loaded:
+        return True
+    loaded.add(key)
+    if len(_LOADED_SKILL_REVISIONS) > _LOADED_SKILL_CONTEXT_LIMIT:
+        for stale in list(_LOADED_SKILL_REVISIONS):
+            if stale != context_id:
+                _LOADED_SKILL_REVISIONS.pop(stale, None)
+                break
+    return False
 
 
 def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
@@ -861,6 +905,9 @@ def _serve_plugin_skill(
     *,
     preprocess: bool = True,
     session_id: str | None = None,
+    mode: str = "summary",
+    reload: bool = False,
+    context_id: str | None = None,
 ) -> str:
     """Read a plugin-provided skill, apply guards, return JSON."""
     from hermes_cli.plugins import _get_disabled_plugins, get_plugin_manager
@@ -945,11 +992,35 @@ def _serve_plugin_skill(
                 "Could not preprocess plugin skill %s:%s", namespace, bare, exc_info=True
             )
 
+    if mode == "summary":
+        _, rendered_content = _parse_frontmatter(rendered_content)
+    rendered_content = f"{banner}{rendered_content}" if banner else rendered_content
+    skill_name = f"{namespace}:{bare}"
+    revision = _skill_revision(rendered_content)
+    if _already_loaded_in_context(context_id, skill_name, revision, mode, reload=reload):
+        return json.dumps(
+            {
+                "success": True,
+                "name": skill_name,
+                "mode": mode,
+                "revision": revision,
+                "already_loaded": True,
+                "content_omitted": True,
+                "hint": "This unchanged skill revision is already in this active context. Pass reload=true only when a fresh read is genuinely required.",
+            },
+            ensure_ascii=False,
+        )
+
+    # Plugin skill registries expose a SKILL.md entrypoint, not a portable
+    # supporting-file contract. Targeted file reads therefore remain local-skill
+    # only until plugin manifests define equivalent safe paths.
     return json.dumps(
         {
             "success": True,
-            "name": f"{namespace}:{bare}",
-            "content": f"{banner}{rendered_content}" if banner else rendered_content,
+            "name": skill_name,
+            "mode": mode,
+            "revision": revision,
+            "content": rendered_content,
             "description": description,
             "linked_files": None,
             "readiness_status": SkillReadinessStatus.AVAILABLE.value,
@@ -963,6 +1034,9 @@ def skill_view(
     file_path: str = None,
     task_id: str = None,
     preprocess: bool = True,
+    mode: str = "summary",
+    reload: bool = False,
+    context_id: str | None = None,
 ) -> str:
     """
     View the content of a skill or a specific file within a skill directory.
@@ -975,11 +1049,22 @@ def skill_view(
         preprocess: Apply configured SKILL.md template and inline shell rendering
             to main skill content. Internal slash/preload callers disable this
             because they render the skill message themselves.
+        mode: ``summary`` (default) returns the mandatory entrypoint body
+            without duplicating YAML metadata; ``full`` returns the complete
+            SKILL.md for debugging or exceptional review.
+        reload: Bypass unchanged-revision deduplication in the same active context.
+        context_id: Runtime-owned active-context generation identifier. Omit for
+            standalone callers; omission intentionally disables deduplication.
 
     Returns:
         JSON string with skill content or error message
     """
     try:
+        if mode not in {"summary", "full"}:
+            return json.dumps(
+                {"success": False, "error": "mode must be either 'summary' or 'full'."},
+                ensure_ascii=False,
+            )
         # Validate before the ':' qualified-name dispatch so a Windows drive
         # path (e.g. C:\skills\foo) can't be reinterpreted as a plugin
         # namespace, and so a traversal/absolute name never reaches the
@@ -1036,12 +1121,26 @@ def skill_view(
                         },
                         ensure_ascii=False,
                     )
+                if file_path:
+                    return json.dumps(
+                        {
+                            "success": False,
+                            "error": (
+                                "Plugin-provided skills expose only their SKILL.md entrypoint; "
+                                "targeted file_path reads require a plugin manifest contract."
+                            ),
+                        },
+                        ensure_ascii=False,
+                    )
                 return _serve_plugin_skill(
                     plugin_skill_md,
                     namespace,
                     bare,
                     preprocess=preprocess,
                     session_id=task_id,
+                    mode=mode,
+                    reload=reload,
+                    context_id=context_id,
                 )
 
             # Plugin exists but this specific skill is missing?
@@ -1561,9 +1660,34 @@ def skill_view(
                     "Could not preprocess skill content for %s", skill_name, exc_info=True
                 )
 
+        # The default payload is an instruction entrypoint, not a duplicate of
+        # metadata that is already returned as structured JSON. ``full`` is
+        # explicit for debugging and exceptional reviews.
+        if mode == "summary":
+            _, rendered_content = _parse_frontmatter(rendered_content)
+        revision = _skill_revision(rendered_content)
+
+        if _already_loaded_in_context(
+            context_id, skill_name, revision, mode, reload=reload
+        ):
+            return json.dumps(
+                {
+                    "success": True,
+                    "name": skill_name,
+                    "mode": mode,
+                    "revision": revision,
+                    "already_loaded": True,
+                    "content_omitted": True,
+                    "hint": "This unchanged skill revision is already in this active context. Pass reload=true only when a fresh read is genuinely required.",
+                },
+                ensure_ascii=False,
+            )
+
         result = {
             "success": True,
             "name": skill_name,
+            "mode": mode,
+            "revision": revision,
             "description": frontmatter.get("description", ""),
             "tags": tags,
             "related_skills": related_skills,
@@ -1585,6 +1709,26 @@ def skill_view(
             if setup_needed
             else SkillReadinessStatus.AVAILABLE.value,
         }
+
+        if mode == "summary" and linked_files:
+            # Preserve deterministic discovery for skills whose entrypoint does
+            # not enumerate references. Retain the path *below* each category:
+            # `templates/colm2025/README.md` becomes `colm2025/README.md`, so
+            # nested files and duplicate basenames remain reconstructable as
+            # `<kind>/<relative-path>`.
+            compact_manifest: dict[str, list[str]] = {}
+            for kind, entries in linked_files.items():
+                category = Path(kind)
+                compact_manifest[kind] = sorted(
+                    Path(item).relative_to(category).as_posix()
+                    if Path(item).is_relative_to(category)
+                    else Path(item).as_posix()
+                    for item in entries
+                )
+            result["linked_files"] = compact_manifest
+            result["usage_hint"] = (
+                "For a targeted read, use file_path='<kind>/<relative-path>' from linked_files."
+            )
 
         setup_help = next((e["help"] for e in required_env_vars if e.get("help")), None)
         if setup_help:
@@ -1623,7 +1767,7 @@ def skill_view(
         # Surface agentskills.io optional fields when present
         if frontmatter.get("compatibility"):
             result["compatibility"] = frontmatter["compatibility"]
-        if isinstance(metadata, dict):
+        if mode == "full" and isinstance(metadata, dict):
             result["metadata"] = metadata
 
         return json.dumps(result, ensure_ascii=False)
@@ -1698,7 +1842,7 @@ SKILLS_LIST_SCHEMA = {
 
 SKILL_VIEW_SCHEMA = {
     "name": "skill_view",
-    "description": "Skills allow for loading information about specific tasks and workflows, as well as scripts and templates. Load a skill's full content or access its linked files (references, templates, scripts). First call returns SKILL.md content plus a 'linked_files' dict showing available references/templates/scripts. To access those, call again with file_path parameter.",
+    "description": "Load a skill's concise mandatory entrypoint by default, or a targeted linked file. Use mode='full' only for explicit debugging/review. Repeated unchanged main-skill loads in one session return a compact already_loaded result instead of reinjecting content.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -1708,7 +1852,16 @@ SKILL_VIEW_SCHEMA = {
             },
             "file_path": {
                 "type": "string",
-                "description": "OPTIONAL: Path to a linked file within the skill (e.g., 'references/api.md', 'templates/config.yaml', 'scripts/validate.py'). Omit to get the main SKILL.md content.",
+                "description": "OPTIONAL: Targeted path within the skill (e.g., 'references/api.md', 'templates/config.yaml', 'scripts/validate.py'). Use this instead of loading unrelated references.",
+            },
+            "mode": {
+                "type": "string",
+                "enum": ["summary", "full"],
+                "description": "Optional main-skill mode. summary (default) returns mandatory instructions without duplicate YAML metadata; full returns raw SKILL.md only for debugging/review.",
+            },
+            "reload": {
+                "type": "boolean",
+                "description": "Optional. Reinject an unchanged main-skill revision in this session only when a fresh read is genuinely required.",
             },
         },
         "required": ["name"],
@@ -1730,7 +1883,12 @@ def _skill_view_with_bump(args, **kw):
     telemetry failure never breaks the tool call."""
     name = args.get("name", "")
     result = skill_view(
-        name, file_path=args.get("file_path"), task_id=kw.get("task_id")
+        name,
+        file_path=args.get("file_path"),
+        task_id=kw.get("task_id"),
+        mode=args.get("mode", "summary"),
+        reload=bool(args.get("reload", False)),
+        context_id=kw.get("context_id"),
     )
     try:
         parsed = json.loads(result)

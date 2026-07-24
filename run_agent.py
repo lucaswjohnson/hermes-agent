@@ -5960,11 +5960,17 @@ class AIAgent:
         ``force=False``.
         """
         from agent.conversation_compression import compress_context
-        return compress_context(
+        compressed = compress_context(
             self, messages, system_message,
             approx_tokens=approx_tokens, task_id=task_id, focus_topic=focus_topic,
             force=force,
         )
+        # A successful compression path may rewrite or rotate the conversation.
+        # Advance the runtime-owned context generation conservatively even when
+        # a compressor returns an equivalent list: reinjecting a skill is safe;
+        # suppressing instructions after a context boundary is not.
+        self._skill_context_generation = getattr(self, "_skill_context_generation", 0) + 1
+        return compressed
 
     def _set_tool_guardrail_halt(self, decision: ToolGuardrailDecision) -> None:
         """Record the first guardrail decision that should stop this turn."""

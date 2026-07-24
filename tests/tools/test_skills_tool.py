@@ -383,6 +383,66 @@ class TestSkillView:
         assert result["success"] is True
         assert result["name"] == "my-skill"
         assert "Step 1" in result["content"]
+        assert result["mode"] == "summary"
+        assert not result["content"].startswith("---")
+
+    def test_full_mode_returns_frontmatter(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "my-skill")
+            result = json.loads(skill_view("my-skill", mode="full", context_id="s:0"))
+        assert result["mode"] == "full"
+        assert result["content"].startswith("---")
+
+    def test_context_aware_dedupe_reload_revision_and_rollover(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            skill_dir = _make_skill(tmp_path, "my-skill", body="revision one")
+            first = json.loads(skill_view("my-skill", context_id="session-a:0"))
+            repeated = json.loads(skill_view("my-skill", context_id="session-a:0"))
+            reloaded = json.loads(skill_view("my-skill", context_id="session-a:0", reload=True))
+            rollover = json.loads(skill_view("my-skill", context_id="session-a:1"))
+            skill_md = skill_dir / "SKILL.md"
+            skill_md.write_text(skill_md.read_text().replace("revision one", "revision two"))
+            changed = json.loads(skill_view("my-skill", context_id="session-a:1"))
+        assert repeated["already_loaded"] is True
+        assert reloaded["content"] == first["content"]
+        assert rollover["content"] == first["content"]
+        assert changed["revision"] != first["revision"]
+        assert "revision two" in changed["content"]
+
+    def test_context_isolation_and_missing_context_do_not_dedupe(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "my-skill")
+            a = json.loads(skill_view("my-skill", context_id="session-a:0"))
+            b = json.loads(skill_view("my-skill", context_id="session-b:0"))
+            no_context_1 = json.loads(skill_view("my-skill", task_id="same-task"))
+            no_context_2 = json.loads(skill_view("my-skill", task_id="same-task"))
+        assert "content" in a and "content" in b
+        assert not b.get("already_loaded", False)
+        assert "content" in no_context_1 and "content" in no_context_2
+
+    def test_plugin_skill_summary_full_and_context_dedupe(self, tmp_path):
+        plugin_skill = tmp_path / "SKILL.md"
+        plugin_skill.write_text(
+            "---\nname: plugin-skill\ndescription: plugin test\n---\n\n# Plugin\n\nPlugin body.\n"
+        )
+        manager = type("Manager", (), {"list_plugin_skills": lambda self, _: []})()
+        with (
+            patch("hermes_cli.plugins._get_disabled_plugins", return_value=set()),
+            patch("hermes_cli.plugins.get_plugin_manager", return_value=manager),
+        ):
+            first = json.loads(skills_tool_module._serve_plugin_skill(
+                plugin_skill, "demo", "plugin-skill", context_id="plugin:0"
+            ))
+            repeated = json.loads(skills_tool_module._serve_plugin_skill(
+                plugin_skill, "demo", "plugin-skill", context_id="plugin:0"
+            ))
+            full = json.loads(skills_tool_module._serve_plugin_skill(
+                plugin_skill, "demo", "plugin-skill", mode="full", context_id="plugin:1"
+            ))
+        assert first["mode"] == "summary" and not first["content"].startswith("---")
+        assert repeated["already_loaded"] is True
+        assert "\n---\nname: plugin-skill" in full["content"]
+        assert full["linked_files"] is None  # plugin registries expose entrypoints only
 
     def test_view_skill_by_frontmatter_name_when_dir_differs(self, tmp_path):
         # The on-disk directory ("alias-dir") differs from the skill's
@@ -503,8 +563,39 @@ class TestSkillView:
             (refs_dir / "guide.md").write_text("guide content")
             raw = skill_view("my-skill")
         result = json.loads(raw)
-        assert result["linked_files"] is not None
-        assert "references" in result["linked_files"]
+        assert result["linked_files"] == {"references": ["guide.md"]}
+        assert "<kind>/<relative-path>" in result["usage_hint"]
+
+    def test_summary_manifest_preserves_nested_paths_and_targeted_reads(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            skill_dir = _make_skill(tmp_path, "nested-skill")
+            files = {
+                "templates/colm2025/README.md": "COLM template",
+                "templates/aaai2026/README.md": "AAAI template",
+                "assets/diagrams/logo.svg": "diagram logo",
+                "assets/icons/logo.svg": "icon logo",
+            }
+            for relative_path, content in files.items():
+                target = skill_dir / relative_path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content)
+
+            summary = json.loads(skill_view("nested-skill"))
+            manifest = summary["linked_files"]
+            reads = {
+                f"{kind}/{relative_path}": json.loads(
+                    skill_view("nested-skill", file_path=f"{kind}/{relative_path}")
+                )
+                for kind, paths in manifest.items()
+                for relative_path in paths
+            }
+
+        assert manifest["templates"] == ["aaai2026/README.md", "colm2025/README.md"]
+        assert manifest["assets"] == ["diagrams/logo.svg", "icons/logo.svg"]
+        assert "COLM template" in reads["templates/colm2025/README.md"]["content"]
+        assert "AAAI template" in reads["templates/aaai2026/README.md"]["content"]
+        assert "diagram logo" in reads["assets/diagrams/logo.svg"]["content"]
+        assert "icon logo" in reads["assets/icons/logo.svg"]["content"]
 
     def test_view_tags_from_metadata(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
@@ -675,7 +766,8 @@ class TestSkillViewSecureSetupOnLoad:
         result = json.loads(raw)
         assert result["success"] is True
         assert result["setup_skipped"] is True
-        assert result["content"].startswith("---")
+        assert not result["content"].startswith("---")
+        assert result["mode"] == "summary"
 
 # ---------------------------------------------------------------------------
 # skill_matches_platform
