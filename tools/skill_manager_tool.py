@@ -118,6 +118,64 @@ def _guard_agent_created_enabled() -> bool:
         return False
 
 
+def _background_review_write_mode() -> str:
+    """Resolve the hard policy for autonomous background skill writes.
+
+    ``stage`` is the safe default: the review may produce a durable proposal,
+    but it cannot change the live skill. ``off`` refuses proposals entirely.
+    ``direct`` restores the historical mutation behavior and must be selected
+    explicitly; the general ``skills.write_approval`` gate still applies.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        raw = cfg_get(
+            load_config(),
+            "skills",
+            "background_review_write_mode",
+            default="stage",
+        )
+    except Exception:
+        return "stage"
+    mode = str(raw or "stage").strip().lower()
+    return mode if mode in {"off", "stage", "direct"} else "stage"
+
+
+def _background_review_scope_guard(
+    action: str,
+    name: str,
+) -> Optional[Dict[str, Any]]:
+    """Block autonomous mutation of existing skills absent foreground use."""
+    try:
+        from tools.skill_provenance import (
+            get_background_review_allowed_skills,
+            is_background_review,
+        )
+
+        if not is_background_review() or action == "create":
+            return None
+        allowed = get_background_review_allowed_skills()
+    except Exception:
+        return {
+            "success": False,
+            "error": "Unable to establish background-review skill scope.",
+            "_fail_closed": True,
+        }
+    if name in allowed:
+        return None
+    return {
+        "success": False,
+        "error": (
+            f"Refusing background-review {action} for skill '{name}': "
+            "the foreground task did not load this skill. Review-time "
+            "discovery does not grant mutation scope. Record a recommendation "
+            "instead of changing an unrelated live skill."
+        ),
+        "_scope_blocked": True,
+        "allowed_skills": sorted(allowed),
+    }
+
+
 def _security_scan_skill(skill_dir: Path) -> Optional[str]:
     """Scan a skill directory after write. Returns error string if blocked, else None.
 
@@ -1259,6 +1317,13 @@ _skill_gate_bypass: "_ctxvars.ContextVar[bool]" = _ctxvars.ContextVar(
 )
 
 
+def _load_write_approval_module():
+    """Small seam for testing fail-closed autonomous gate loading."""
+    from tools import write_approval
+
+    return write_approval
+
+
 def _apply_skill_write_gate(action, name, **payload_kwargs):
     """Evaluate the skill write gate. Returns a JSON tool-result string when the
     write should NOT proceed (blocked or staged), or None to perform the real
@@ -1269,12 +1334,50 @@ def _apply_skill_write_gate(action, name, **payload_kwargs):
     if _skill_gate_bypass.get():
         return None
 
+    background_review = False
     try:
-        from tools import write_approval as wa
-    except Exception:
-        return None  # fail open
+        from tools.skill_provenance import is_background_review
 
+        background_review = is_background_review()
+    except Exception:
+        # Provenance is a security boundary for autonomous writes. If it
+        # cannot be established, the later approval import must not fail open.
+        background_review = True
+
+    try:
+        wa = _load_write_approval_module()
+    except Exception:
+        if background_review:
+            return tool_error(
+                "Unable to establish the autonomous skill-write gate; "
+                "refusing the background review write.",
+                success=False,
+            )
+        return None  # Preserve historical foreground behavior.
+
+    origin = wa.current_origin()
+    review_mode = _background_review_write_mode()
+    if origin == "background_review" and review_mode == "off":
+        return tool_error(
+            "Background skill proposals are disabled by "
+            "skills.background_review_write_mode=off.",
+            success=False,
+        )
+
+    # Autonomous review is proposal-only unless the operator explicitly opts
+    # back into the historical direct-write mode. This is independent of
+    # skills.write_approval so a later config change cannot silently reopen
+    # background mutation authority.
+    force_stage = origin == "background_review" and review_mode == "stage"
     decision = wa.evaluate_gate(wa.SKILLS)
+    if force_stage:
+        decision = wa.GateDecision(
+            stage=True,
+            message=(
+                "Staged as a background self-improvement proposal. "
+                "The live skill was not changed."
+            ),
+        )
     if decision.allow:
         return None
     if decision.blocked:
@@ -1290,7 +1393,19 @@ def _apply_skill_write_gate(action, name, **payload_kwargs):
         old_string=payload_kwargs.get("old_string") or "",
         new_string=payload_kwargs.get("new_string") or "",
     )
-    record = wa.stage_write(wa.SKILLS, payload, summary=gist, origin=wa.current_origin())
+    if origin == "background_review":
+        try:
+            from tools.skill_provenance import get_background_review_allowed_skills
+
+            allowed = sorted(get_background_review_allowed_skills())
+        except Exception:
+            allowed = []
+        payload["_proposal_policy"] = {
+            "write_mode": review_mode,
+            "allowed_skills": allowed,
+            "requires_validation": True,
+        }
+    record = wa.stage_write(wa.SKILLS, payload, summary=gist, origin=origin)
     return json.dumps(
         {"success": True, "staged": True, "pending_id": record["id"],
          "gist": gist, "message": decision.message},
@@ -1337,6 +1452,10 @@ def skill_manage(
 
     Returns JSON string with results.
     """
+    scope_guard = _background_review_scope_guard(action, name)
+    if scope_guard is not None:
+        return json.dumps(scope_guard, ensure_ascii=False)
+
     preflight = _background_review_preflight(action, name)
     if preflight is not None:
         return json.dumps(preflight, ensure_ascii=False)

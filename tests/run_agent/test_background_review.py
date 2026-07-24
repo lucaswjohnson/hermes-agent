@@ -2,6 +2,13 @@
 
 from __future__ import annotations
 
+import json
+from collections import namedtuple
+
+from agent.background_review import (
+    _background_review_has_capacity,
+    _foreground_skill_names,
+)
 import run_agent as run_agent_module
 from run_agent import AIAgent
 
@@ -38,6 +45,42 @@ class ImmediateThread:
 
     def start(self):
         self._target()
+
+
+def test_foreground_skill_names_uses_only_foreground_skill_view_calls():
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "function": {
+                        "name": "skill_view",
+                        "arguments": json.dumps({"name": "used-skill"}),
+                    }
+                },
+                {
+                    "function": {
+                        "name": "skills_list",
+                        "arguments": "{}",
+                    }
+                },
+            ],
+        }
+    ]
+    assert _foreground_skill_names(messages) == frozenset({"used-skill"})
+
+
+def test_background_review_capacity_gate(monkeypatch):
+    Usage = namedtuple("Usage", "total used free")
+    monkeypatch.setattr(
+        "agent.background_review.shutil.disk_usage",
+        lambda _path: Usage(100, 98, 2),
+    )
+    monkeypatch.setattr(
+        "agent.background_review.get_hermes_home",
+        lambda: "/tmp/hermes",
+    )
+    assert _background_review_has_capacity() is False
 
 
 def test_background_review_shuts_down_memory_provider_before_close(monkeypatch):

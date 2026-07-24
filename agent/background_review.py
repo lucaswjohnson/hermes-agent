@@ -1,11 +1,11 @@
 """Background memory/skill review — fork the agent to evaluate the turn.
 
-After every turn, ``AIAgent.run_conversation`` may call
+After eligible turns, ``AIAgent.run_conversation`` may call
 :func:`spawn_background_review` to fire off a daemon thread that replays
 the conversation snapshot in a forked :class:`AIAgent` and asks itself
-"should any skill/memory be saved or updated?".  Writes go straight to
-the memory + skill stores.  Main conversation and prompt cache are never
-touched.
+"should any skill/memory be saved or updated?". Background skill changes are
+proposal-only by default and are staged outside the live skill store. Main
+conversation and prompt cache are never touched.
 
 The fork inherits the parent's live runtime (provider, model, base_url,
 credentials, cached system prompt) so it hits the same prefix cache and
@@ -21,11 +21,80 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 from typing import Any, Dict, List, Optional
 
 from agent.thread_scoped_output import thread_scoped_silence
+from hermes_constants import get_hermes_home
 
 logger = logging.getLogger(__name__)
+
+
+def _foreground_skill_names(messages_snapshot: List[Dict]) -> frozenset[str]:
+    """Extract skills actually loaded by the foreground conversation."""
+    names: set[str] = set()
+    for message in messages_snapshot or []:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        for tool_call in message.get("tool_calls", []) or []:
+            if not isinstance(tool_call, dict):
+                continue
+            fn = tool_call.get("function") or {}
+            if fn.get("name") != "skill_view":
+                continue
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            name = str(args.get("name") or "").strip()
+            if name:
+                names.add(name)
+    return frozenset(names)
+
+
+def _background_review_has_capacity() -> bool:
+    """Fail closed when persistent storage lacks safe review headroom."""
+    min_free_bytes = 1_073_741_824
+    min_free_percent = 0.0
+    try:
+        from hermes_cli.config import cfg_get, load_config
+
+        cfg = load_config()
+        min_free_bytes = int(
+            cfg_get(
+                cfg,
+                "skills",
+                "background_review_min_free_bytes",
+                default=min_free_bytes,
+            )
+        )
+        min_free_percent = float(
+            cfg_get(
+                cfg,
+                "skills",
+                "background_review_min_free_percent",
+                default=min_free_percent,
+            )
+        )
+        usage = shutil.disk_usage(get_hermes_home())
+    except Exception:
+        logger.warning(
+            "Skipping background review: unable to establish disk headroom.",
+            exc_info=True,
+        )
+        return False
+    free_percent = (usage.free / usage.total * 100.0) if usage.total else 0.0
+    allowed = usage.free >= min_free_bytes and free_percent >= min_free_percent
+    if not allowed:
+        logger.warning(
+            "Skipping background review: free=%d bytes (%.2f%%), "
+            "required=%d bytes and %.2f%%.",
+            usage.free,
+            free_percent,
+            min_free_bytes,
+            min_free_percent,
+        )
+    return allowed
 
 
 # ---------------------------------------------------------------------------
@@ -179,15 +248,17 @@ _MEMORY_REVIEW_PROMPT = (
 )
 
 _SKILL_REVIEW_PROMPT = (
-    "Review the conversation above and update the skill library. Be "
-    "ACTIVE — most sessions produce at least one skill update, even if "
-    "small. A pass that does nothing is a missed learning opportunity, "
-    "not a neutral outcome.\n\n"
+    "Review the conversation above for durable skill-library improvements. "
+    "No change is a normal successful outcome. Propose a change only when "
+    "the transcript contains direct, reusable evidence; do not create work "
+    "merely to make the review non-empty. Background changes are staged "
+    "proposals and do not alter live skills.\n\n"
     "Target shape of the library: CLASS-LEVEL skills, each with a rich "
     "SKILL.md and a `references/` directory for session-specific detail. "
     "Not a long flat list of narrow one-session-one-skill entries. This "
     "shapes HOW you update, not WHETHER you update.\n\n"
-    "Signals to look for (any one of these warrants action):\n"
+    "Signals to look for (each warrants a scoped proposal, not automatic "
+    "promotion):\n"
     "  • User corrected your style, tone, format, legibility, or "
     "verbosity. Frustration signals like 'stop doing X', 'this is too "
     "verbose', 'don't format like this', 'why are you explaining', "
@@ -202,7 +273,7 @@ _SKILL_REVIEW_PROMPT = (
     "tool-usage pattern emerged that a future session would benefit "
     "from. Capture it.\n"
     "  • A skill that got loaded or consulted this session turned out "
-    "to be wrong, missing a step, or outdated. Patch it NOW.\n\n"
+    "to be wrong, missing a step, or outdated. Propose a precise patch.\n\n"
     "Preference order — prefer the earliest action that fits, but do "
     "pick one when a signal above fired:\n"
     "  1. UPDATE A CURRENTLY-LOADED SKILL. Look back through the "
@@ -289,13 +360,14 @@ _COMBINED_REVIEW_PROMPT = (
     "desires, preferences, personal details, or expectations about "
     "how you should behave? Save facts about the user and durable "
     "preferences with the memory tool.\n\n"
-    "**Skills**: how to do this class of task. Be ACTIVE — most "
-    "sessions produce at least one skill update. A pass that does "
-    "nothing is a missed learning opportunity, not a neutral outcome.\n\n"
+    "**Skills**: how to do this class of task. No skill change is a normal "
+    "successful outcome. Propose only a direct, reusable correction supported "
+    "by the transcript. Background changes are staged proposals and do not "
+    "alter live skills.\n\n"
     "Target shape of the skill library: CLASS-LEVEL skills with a rich "
     "SKILL.md and a `references/` directory for session-specific detail. "
     "Not a long flat list of narrow one-session-one-skill entries.\n\n"
-    "Signals that warrant a skill update (any one is enough):\n"
+    "Signals that warrant a scoped proposal:\n"
     "  • User corrected your style, tone, format, legibility, "
     "verbosity, or approach. Frustration is a FIRST-CLASS skill "
     "signal, not just a memory signal. 'stop doing X', 'don't format "
@@ -304,7 +376,7 @@ _COMBINED_REVIEW_PROMPT = (
     "  • Non-trivial technique, fix, workaround, or debugging path "
     "emerged.\n"
     "  • A skill that was loaded or consulted turned out wrong, "
-    "missing, or outdated — patch it now.\n\n"
+    "missing, or outdated — propose a precise patch.\n\n"
     "Preference order for skills — pick the earliest that fits:\n"
     "  1. UPDATE A CURRENTLY-LOADED SKILL. Check what skills were "
     "loaded via /skill-name or skill_view in the conversation. If one "
@@ -840,6 +912,21 @@ def _run_review_in_thread(
             except Exception:
                 pass
 
+            scope_token = None
+            try:
+                from tools.skill_provenance import (
+                    set_background_review_allowed_skills,
+                )
+
+                scope_token = set_background_review_allowed_skills(
+                    set(_foreground_skill_names(messages_snapshot))
+                )
+            except Exception:
+                logger.warning(
+                    "Unable to bind background-review skill scope.",
+                    exc_info=True,
+                )
+
             try:
                 # Routed to a different model -> replay a digest (cache is cold
                 # on that model anyway, so minimise cold-written tokens). Same
@@ -858,6 +945,15 @@ def _run_review_in_thread(
                     conversation_history=_review_history,
                 )
             finally:
+                if scope_token is not None:
+                    try:
+                        from tools.skill_provenance import (
+                            reset_background_review_allowed_skills,
+                        )
+
+                        reset_background_review_allowed_skills(scope_token)
+                    except Exception:
+                        pass
                 clear_thread_tool_whitelist()
 
             # Snapshot review actions before teardown. close() is allowed to
@@ -965,6 +1061,12 @@ def spawn_background_review_thread(
     owns the actual ``threading.Thread`` construction so test-level patches
     of ``run_agent.threading.Thread`` keep working.
     """
+    if not _background_review_has_capacity():
+        def _no_capacity_target() -> None:
+            return None
+
+        return _no_capacity_target, "Background review skipped: insufficient capacity."
+
     # Pick the right prompt based on which triggers fired.  Allow per-agent
     # override (the prompts moved to module-level constants but old code paths
     # that set agent._MEMORY_REVIEW_PROMPT etc. directly keep working).
