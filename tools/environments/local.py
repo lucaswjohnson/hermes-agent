@@ -6,6 +6,7 @@ import ntpath
 import os
 import platform
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -656,6 +657,30 @@ def _append_missing_sane_path_entries(existing_path: str) -> str:
     return ":".join(ordered)
 
 
+def _prepend_login_path_completion(cmd_string: str) -> str:
+    """Complete POSIX PATH after login/profile files, before snapshot capture.
+
+    A login shell can replace the PATH supplied by _make_run_env. Append the
+    known runtime directories without replacing profile-selected precedence.
+    Only the initial snapshot needs this; later explicit PATH exports remain
+    untouched. Native Windows/Git Bash keeps its existing path handling.
+    """
+    if _IS_WINDOWS:
+        return cmd_string
+    bin_dir = _resolve_hermes_bin_dir()
+    entries = dict.fromkeys([*_SANE_PATH.split(":"), *_managed_runtime_path_entries(),
+                             *_user_local_bin_entries(), *([bin_dir] if isinstance(bin_dir, str) else [])])
+    paths = " ".join(shlex.quote(entry) for entry in entries)
+    return (
+        f"for __hermes_path_entry in {paths}; do\n"
+        '  case ":${PATH-}:" in\n'
+        '    *:"$__hermes_path_entry":*) ;;\n'
+        '    *) PATH="${PATH:+$PATH:}$__hermes_path_entry" ;;\n'
+        "  esac\n"
+        "done\nexport PATH\nunset __hermes_path_entry\n" + cmd_string
+    )
+
+
 def _apply_windows_msys_bash_env_defaults(env: dict) -> None:
     """Disable MSYS argument path conversion (``/FO`` -> ``C:/.../git/FO`` breaks
     tasklist/schtasks/wmic/``cmd /c``). Git for Windows honors ``MSYS_NO_PATHCONV``;
@@ -939,7 +964,8 @@ class LocalEnvironment(BaseEnvironment):
         # Login invocations (init_session's env snapshot) source the user's rc /
         # custom init files so nvm/asdf/pyenv land on PATH in the snapshot.
         if login:
-            cmd_string = _prepend_shell_init(cmd_string, _resolve_shell_init_files())
+            cmd_string = _prepend_shell_init(
+                _prepend_login_path_completion(cmd_string), _resolve_shell_init_files())
         args = [bash, *(["-l"] if login else []), "-c", cmd_string]
         self._recover_cwd()
         proc = subprocess.Popen(
