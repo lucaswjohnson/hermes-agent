@@ -2,15 +2,15 @@
 
 ## Change
 
-The existing scratch cleanup now expires old generated Metro cache files on their own. Previously, any recent write under `cache/scratch/metro-cache` kept every old file across all 256 shards.
+Scratch cleanup now expires old generated Metro cache files independently. Previously, any recent write under `cache/scratch/metro-cache` kept every old file across all 256 shards.
 
-Cleanup only considers regular cache files with hexadecimal names inside two-character hexadecimal shard directories. Recent files, symlinks, unknown files, and unknown directories remain. The shared cache root is never passed to recursive scratch deletion.
+Cleanup considers only regular cache files with hexadecimal names inside two-character hexadecimal shard directories. Recent files, symlinks, unknown files, and unknown directories remain. The shared cache root is never passed to recursive scratch deletion.
 
 A same-user process holds the whole cache if it references the cache through its command, working directory, executable, open files, or mapped files. Active Metro/Expo commands also hold it. Enabled Hermes jobs that refer to the cache or Metro/Expo hold it. If inspection of same-user processes or scheduled jobs is incomplete, cleanup stops. Cache cleanup does not kill consumers.
 
 The existing retention interval and `prune_scratch_dir` entry point remain in use. This adds no scheduler or closeout framework. Ordinary non-Metro scratch pruning is unchanged, including its existing process-reaping behavior. This patch does not establish that unrelated age-based worktree deletion is safe. Replace this narrow extension when upstream scratch retention provides equivalent generated-cache expiry and consumer holds.
 
-## Exercised on October 12, 2026
+## Tested on October 12, 2026
 
 - Existing pruning and unreadable-subtree checks: six passed. A broader run passed 18 checks and failed two unchanged container-permission checks. The initially cached pytest interpreter lacked YAML. Using the runtime interpreter with the existing cached pytest resolved the environment error without installation.
 - Direct testing preserved a live process and its cache, then removed one stale generated file after that process exited. Recent data, an unknown source file, and a symlink survived. The shared root survived ordinary scratch pruning.
