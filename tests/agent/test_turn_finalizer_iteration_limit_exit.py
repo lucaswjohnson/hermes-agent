@@ -165,6 +165,20 @@ def test_pending_response_does_not_mask_later_terminal_exit(
     assert agent._handle_max_iterations_called is False
 
 
+def test_async_delegation_pending_exit_is_not_marked_completed(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = _LimitAgent(budget_remaining=5)
+
+    result = _finalize(
+        agent,
+        final_response="Progress update — work is continuing.",
+        api_call_count=1,
+        exit_reason="async_delegation_pending",
+    )
+
+    assert result["completed"] is False
+
+
 def test_pending_response_records_kanban_timeout(monkeypatch):
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
     monkeypatch.setenv("HERMES_KANBAN_TASK", "task-123")

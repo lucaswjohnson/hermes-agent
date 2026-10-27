@@ -215,6 +215,38 @@ async def test_inject_watch_notification_routes_from_session_store_origin(monkey
 
 
 @pytest.mark.asyncio
+async def test_async_delegation_injection_carries_processing_identity(monkeypatch, tmp_path):
+    from gateway.session import SessionSource
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    adapter = runner.adapters[Platform.TELEGRAM]
+    runner.session_store._entries["agent:main:telegram:group:-100:42"] = SimpleNamespace(
+        origin=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-100",
+            chat_type="group",
+            thread_id="42",
+            user_id="123",
+            user_name="Emiliyan",
+        )
+    )
+
+    await runner._inject_watch_notification(
+        "[delegation completed]",
+        {
+            "type": "async_delegation",
+            "delegation_id": "deleg_1234",
+            "parent_session_id": "parent-session",
+            "session_key": "agent:main:telegram:group:-100:42",
+        },
+    )
+
+    synth_event = adapter.handle_message.await_args.args[0]
+    assert synth_event.metadata["gateway_session_id"] == "parent-session"
+    assert synth_event.metadata["async_delegation_id"] == "deleg_1234"
+
+
+@pytest.mark.asyncio
 async def test_post_turn_watch_drain_off_consumes_without_injecting(monkeypatch, tmp_path):
     runner = _build_runner(monkeypatch, tmp_path, "off")
     adapter = runner.adapters[Platform.TELEGRAM]

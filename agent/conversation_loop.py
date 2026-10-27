@@ -112,6 +112,51 @@ from utils import base_url_host_matches, env_var_enabled
 logger = logging.getLogger(__name__)
 
 
+def _guard_async_delegation_final_response(agent, final_response, final_msg):
+    """Label a model stop as progress while session-owned work is unsettled."""
+    try:
+        from tools.async_delegation import outstanding_for_session
+
+        outstanding = outstanding_for_session(
+            parent_session_id=str(getattr(agent, "session_id", "") or ""),
+        )
+    except Exception:
+        logger.debug("async delegation final-response guard failed", exc_info=True)
+        outstanding = []
+
+    if not outstanding:
+        return final_response, False
+
+    live = [
+        item for item in outstanding
+        if item.get("status") in {"running", "stalling", "finalizing"}
+    ]
+    queued = [item for item in outstanding if item not in live]
+    if live:
+        running = "; ".join(
+            str(item.get("goal") or item.get("delegation_id") or "delegated task")
+            for item in live
+        )
+    else:
+        running = "no worker process; a completed worker result is queued for review"
+
+    if queued:
+        remaining = "receive and review the worker result, then complete final verification"
+    else:
+        remaining = "wait for the worker result, review it, then complete final verification"
+
+    progress = (
+        "Progress update — work is continuing.\n\n"
+        f"Current turn update (not final):\n{final_response}\n\n"
+        f"Running: {running}\n"
+        f"Remaining: {remaining}.\n"
+        f"Waiting for another worker: {'yes' if live else 'no; the result is queued'}."
+    )
+    final_msg["content"] = progress
+    final_msg["finish_reason"] = "async_delegation_pending"
+    return progress, True
+
+
 # Scaffold marker used by _apply_active_turn_redirect and the ghost-row filter
 # in the api_messages loop. Module-level so both sites can never drift.
 _INTERRUPT_SCAFFOLD_MARKER = "[This response was interrupted by a user correction.]"
@@ -8679,6 +8724,11 @@ def run_conversation(
                     final_response = None
                     continue
 
+                final_response, _async_delegation_pending = (
+                    _guard_async_delegation_final_response(
+                        agent, final_response, final_msg
+                    )
+                )
                 append_message(messages, final_msg)
                 # Make the completed answer durable before leaving the loop —
                 # a session torn down before finalize_turn's _persist_session
@@ -8698,9 +8748,18 @@ def run_conversation(
                         exc_info=True,
                     )
 
-                _turn_exit_reason = f"text_response(finish_reason={finish_reason})"
+                _turn_exit_reason = (
+                    "async_delegation_pending"
+                    if _async_delegation_pending
+                    else f"text_response(finish_reason={finish_reason})"
+                )
                 if not agent.quiet_mode:
-                    agent._safe_print(f"🎉 Conversation completed after {api_call_count} OpenAI-compatible API call(s)")
+                    if _async_delegation_pending:
+                        agent._safe_print(
+                            "⏳ Progress update emitted; delegated work is still pending"
+                        )
+                    else:
+                        agent._safe_print(f"🎉 Conversation completed after {api_call_count} OpenAI-compatible API call(s)")
                 break
             
         except Exception as e:

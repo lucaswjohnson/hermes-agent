@@ -153,6 +153,74 @@ def test_active_for_session_counts_every_live_delegation_state():
     assert ad.active_for_session("") == 0
 
 
+def test_outstanding_for_session_includes_live_and_undelivered_completion(
+    tmp_path, monkeypatch
+):
+    """A finished worker remains outstanding until its result re-enters the chat."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    with ad._records_lock:
+        ad._records["deleg_live"] = {
+            "delegation_id": "deleg_live",
+            "status": "running",
+            "session_key": "slack:thread",
+            "parent_session_id": "parent-session",
+            "goal": "inspect logs",
+        }
+
+    pending_record = {
+        "delegation_id": "deleg_pending",
+        "session_key": "slack:thread",
+        "origin_ui_session_id": "",
+        "parent_session_id": "parent-session",
+        "origin_session_id": "",
+        "dispatched_at": time.time(),
+        "goal": "run tests",
+        "status": "completed",
+        "_completion_state": "pending",
+    }
+    with ad._records_lock:
+        ad._records["deleg_pending"] = pending_record
+    ad._persist_dispatch(pending_record)
+    ad._persist_completion(
+        {
+            "delegation_id": "deleg_pending",
+            "status": "completed",
+            "completed_at": time.time(),
+        },
+        {"summary": "tests passed"},
+    )
+
+    outstanding = ad.outstanding_for_session(
+        session_key="slack:thread",
+        parent_session_id="parent-session",
+    )
+
+    assert {item["delegation_id"] for item in outstanding} == {
+        "deleg_live",
+        "deleg_pending",
+    }
+    pending = next(item for item in outstanding if item["delegation_id"] == "deleg_pending")
+    assert pending["status"] == "completed"
+    assert pending["delivery_state"] == "pending"
+
+    assert ad.mark_completion_delivered("deleg_pending") is True
+    outstanding = ad.outstanding_for_session(
+        session_key="slack:thread",
+        parent_session_id="parent-session",
+    )
+    assert {item["delegation_id"] for item in outstanding} == {
+        "deleg_live",
+        "deleg_pending",
+    }
+
+    ad.mark_completion_processing("deleg_pending")
+    outstanding = ad.outstanding_for_session(
+        session_key="slack:thread",
+        parent_session_id="parent-session",
+    )
+    assert [item["delegation_id"] for item in outstanding] == ["deleg_live"]
+
+
 def test_dispatch_returns_immediately_without_blocking():
     gate = threading.Event()
 

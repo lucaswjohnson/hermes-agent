@@ -233,9 +233,11 @@ def finalize_turn(
 
     # Determine if conversation completed successfully
     normal_text_response = str(_turn_exit_reason).startswith("text_response(")
+    work_still_pending = str(_turn_exit_reason) == "async_delegation_pending"
     completed = (
         final_response is not None
         and not failed
+        and not work_still_pending
         and (
             api_call_count < agent.max_iterations
             or normal_text_response

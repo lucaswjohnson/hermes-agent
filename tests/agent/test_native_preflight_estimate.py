@@ -129,6 +129,25 @@ def test_midturn_pressure_uses_pruned_estimate_when_eligible():
     ) == native
 
 
+def test_midturn_pressure_reuses_empty_checkpoint_carrier_after_resume():
+    """A DB-restored checkpoint carrier has empty visible assistant content."""
+    from agent.conversation_loop import (
+        _midturn_request_pressure_tokens,
+        estimate_messages_tokens_rough,
+    )
+
+    agent = _codex_agent()
+    messages = _history_with_checkpoint()
+    checkpoint = messages[-2]
+    checkpoint["content"] = ""
+    generic = estimate_messages_tokens_rough(messages)
+    native = estimate_native_responses_preflight_tokens(agent, messages)
+
+    assert native is not None
+    assert generic > native * 2
+    assert _midturn_request_pressure_tokens(agent, messages, "", generic) == native
+
+
 def test_midturn_pressure_falls_back_to_generic_plus_tools_when_ineligible():
     from agent.conversation_loop import (
         _estimate_tools_tokens_rough,

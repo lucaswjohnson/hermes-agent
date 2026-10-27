@@ -22177,6 +22177,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # session_entry.session_id while the old run is still unwinding.
             _run_start_session_id = session_entry.session_id
             _turn_started_monotonic = time.monotonic()
+            _delegation_completion_id = str(
+                (getattr(event, "metadata", None) or {}).get(
+                    "async_delegation_id", ""
+                )
+                or ""
+            )
+            if _delegation_completion_id:
+                from tools.async_delegation import mark_completion_processing
+
+                mark_completion_processing(_delegation_completion_id)
             agent_result = await self._run_agent(
                 message=message_text,
                 context_prompt=context_prompt,
@@ -27191,6 +27201,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
             if parent_session_id:
                 metadata["gateway_session_id"] = parent_session_id
+            delegation_id = str(evt.get("delegation_id") or "").strip()
+            if delegation_id:
+                metadata["async_delegation_id"] = delegation_id
             synth_event = MessageEvent(
                 text=synth_text,
                 message_type=MessageType.TEXT,
@@ -27439,8 +27452,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # after adapter acceptance; this gateway keeps no parallel ledger.
             if durable_claim_id:
                 try:
-                    from tools.async_delegation import complete_completion_delivery
+                    from tools.async_delegation import (
+                        complete_completion_delivery,
+                        mark_completion_accepted,
+                    )
 
+                    mark_completion_accepted(durable_delegation_id)
                     complete_completion_delivery(
                         durable_delegation_id, durable_claim_id,
                     )

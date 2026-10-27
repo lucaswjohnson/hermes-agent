@@ -708,6 +708,53 @@ def has_live_for_session(
         )
 
 
+def outstanding_for_session(
+    session_key: str = "",
+    origin_ui_session_id: str = "",
+    parent_session_id: str = "",
+) -> List[Dict[str, Any]]:
+    """Return work whose completion has not begun processing in the session."""
+    if not session_key and not origin_ui_session_id and not parent_session_id:
+        return []
+
+    with _records_lock:
+        return [
+            {
+                "delegation_id": str(r.get("delegation_id") or delegation_id),
+                "status": str(r.get("status") or "running"),
+                "goal": str(r.get("goal") or "delegated task"),
+                "delivery_state": str(r.get("_completion_state") or "pending"),
+            }
+            for delegation_id, r in _records.items()
+            if (
+                r.get("status") in {"running", "stalling", "finalizing"}
+                or r.get("_completion_state") in {"pending", "accepted"}
+            )
+            and _matches_session_selectors(
+                r,
+                session_key=session_key,
+                origin_ui_session_id=origin_ui_session_id,
+                parent_session_id=parent_session_id,
+            )
+        ]
+
+
+def mark_completion_accepted(delegation_id: str) -> None:
+    """Record adapter acceptance without confusing it for turn processing."""
+    with _records_lock:
+        record = _records.get(delegation_id)
+        if record is not None and record.get("_completion_state") == "pending":
+            record["_completion_state"] = "accepted"
+
+
+def mark_completion_processing(delegation_id: str) -> None:
+    """Release the final-answer guard when the completion turn actually starts."""
+    with _records_lock:
+        record = _records.get(delegation_id)
+        if record is not None:
+            record["_completion_state"] = "processing"
+
+
 def _new_delegation_id() -> str:
     return f"deleg_{uuid.uuid4().hex[:8]}"
 
@@ -721,6 +768,7 @@ def _prune_completed_locked() -> None:
         (rid, r)
         for rid, r in _records.items()
         if r.get("status") != "running"
+        and r.get("_completion_state") not in {"pending", "accepted"}
     ]
     if len(completed) <= _MAX_RETAINED_COMPLETED:
         return
@@ -831,6 +879,7 @@ def dispatch_async_delegation(
         "parent_session_id": parent_session_id,
         **_capture_routing_origin(),
         "status": "running",
+        "_completion_state": "running",
         "dispatched_at": dispatched_at,
         "completed_at": None,
         "interrupt_fn": interrupt_fn,
@@ -942,6 +991,7 @@ def _finish_finalization(delegation_id: str, status: str) -> None:
         record = _records.get(delegation_id)
         if record is not None:
             record["status"] = status
+            record["_completion_state"] = "pending"
         _prune_completed_locked()
 
 
@@ -1078,6 +1128,7 @@ def dispatch_async_delegation_batch(
         "parent_session_id": parent_session_id,
         **_capture_routing_origin(),
         "status": "running",
+        "_completion_state": "running",
         "dispatched_at": dispatched_at,
         "completed_at": None,
         "interrupt_fn": interrupt_fn,
