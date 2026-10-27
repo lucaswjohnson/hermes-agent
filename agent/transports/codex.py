@@ -167,52 +167,23 @@ class ResponsesApiTransport(ProviderTransport):
 
         response_tools = _responses_tools(tools)
 
-        # xAI server-side web search.
+        # Native server-side web search for Codex and xAI Responses backends.
         #
-        # grok models on xAI's /v1/responses surface (notably
-        # grok-composer-2.5-fast on SuperGrok OAuth) have a *native*,
-        # server-executed web search.  When the model is handed a
-        # client-side function literally named ``web_search``, it routes
-        # the intent to that native engine — but because the tool is
-        # declared as a plain ``function`` rather than xAI's first-class
-        # ``{"type": "web_search"}`` built-in, the server-side search is
-        # dispatched but never reconciled: the response streams reasoning
-        # + ``web_search_call`` progress items, the searches never reach
-        # ``status="completed"`` in the assembled output, no final
-        # message is emitted, and ``_normalize_codex_response`` correctly
-        # sees reasoning-with-no-answer and reports ``incomplete``.  The
-        # turn then burns 3 continuation retries and fails with "Codex
-        # response remained incomplete after 3 continuation attempts".
-        # Verified live against grok-composer-2.5-fast (2026-06).
+        # Both providers expose a first-class ``{"type": "web_search"}``
+        # built-in.  When Hermes also supplies its client-side function named
+        # ``web_search``, the provider either rejects the duplicate name or
+        # bypasses the client function.  Replace that one function with the
+        # provider-owned tool so routine current-information searches use the
+        # authenticated model subscription rather than the configured external
+        # search provider.  ``web_extract`` remains client-side for full-page
+        # parsing and source material.
         #
-        # Fix: when the agent HAS a client-side ``web_search`` function (i.e.
-        # the user enabled the web toolset), declare xAI's native
-        # ``web_search`` built-in instead so the search actually runs to
-        # completion server-side and the model streams a real answer.  The
-        # Responses API rejects two tools sharing the name ``web_search``
-        # (HTTP 400 "Duplicate tool names"), so we drop the client-side
-        # ``web_search`` function for the xAI path and let the native tool
-        # satisfy it.  All other client-side tools (read_file, terminal,
-        # web_extract, MCP tools, …) are untouched and continue to dispatch
-        # through Hermes's agent loop.
-        #
-        # Scope: we ONLY swap in the native built-in when the client
-        # ``web_search`` was actually present.  We do NOT force-enable Grok
-        # server-side search on turns where the user never had web enabled —
-        # that would silently route around Hermes's web-provider config and
-        # tool-trace/citation plumbing for every xai-oauth turn.  The swap is
-        # a 1:1 replacement of an already-requested capability, not an
-        # additive grant.
-        #
-        # NOTE: for the swapped case this routes ``web_search`` to Grok's
-        # native search engine for xAI sessions instead of Hermes's
-        # configured web provider (Tavily/etc.), and those results bypass
-        # Hermes's tool-trace / citation plumbing (they arrive baked into the
-        # model's answer rather than as a tool result the loop observes).
-        # Scoped to ``is_xai_responses`` deliberately; narrow to specific
-        # models if a future grok variant should keep the client-side
-        # function.
-        if is_xai_responses and response_tools:
+        # This is deliberately a 1:1 replacement: if a turn does not expose
+        # Hermes's web_search capability, do not silently grant native search.
+        # The Responses adapter already treats ``web_search_call`` as a
+        # provider-executed completed item, including when its item-level
+        # status lags the completed response status.
+        if (is_xai_responses or is_codex_backend) and response_tools:
             has_client_web_search = any(
                 isinstance(t, dict) and t.get("name") == "web_search"
                 for t in response_tools

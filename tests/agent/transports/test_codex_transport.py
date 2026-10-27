@@ -366,9 +366,36 @@ class TestCodexBuildKwargs:
             for t in tools
         )
 
-    def test_non_xai_path_does_not_inject_native_web_search(self, transport):
-        """Native web_search injection is scoped to xAI — Codex/GitHub paths
-        keep the client-side web_search function untouched."""
+    def test_codex_injects_native_web_search_when_client_web_search_present(self, transport):
+        """Codex-native web search replaces the Firecrawl function for Codex OAuth turns."""
+        messages = [{"role": "user", "content": "Find current prices."}]
+        kw = transport.build_kwargs(
+            model="gpt-5.5", messages=messages,
+            tools=[
+                {"type": "function", "function": {
+                    "name": "read_file", "description": "Read a file.",
+                    "parameters": {"type": "object",
+                                   "properties": {"path": {"type": "string"}}}}},
+                {"type": "function", "function": {
+                    "name": "web_search", "description": "Search the web.",
+                    "parameters": {"type": "object",
+                                   "properties": {"query": {"type": "string"}}}}},
+            ],
+            is_codex_backend=True,
+        )
+        tools = kw.get("tools", [])
+        assert {"type": "web_search"} in tools
+        assert any(
+            t.get("type") == "function" and t.get("name") == "read_file"
+            for t in tools
+        )
+        assert not any(
+            t.get("type") == "function" and t.get("name") == "web_search"
+            for t in tools
+        )
+
+    def test_non_native_path_keeps_client_web_search(self, transport):
+        """Non-xAI, non-Codex Responses paths retain Hermes's web provider."""
         messages = [{"role": "user", "content": "Search."}]
         kw = transport.build_kwargs(
             model="gpt-5.4", messages=messages,
@@ -377,6 +404,7 @@ class TestCodexBuildKwargs:
                 "parameters": {"type": "object",
                                "properties": {"query": {"type": "string"}}}}}],
             is_xai_responses=False,
+            is_codex_backend=False,
         )
         tools = kw.get("tools", [])
         assert not any(t.get("type") == "web_search" for t in tools)
