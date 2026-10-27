@@ -299,6 +299,32 @@ class TestBuildSessionContextPrompt:
         assert "pin" in prompt.lower()
         assert "current message's slack block/attachment payload" in prompt.lower()
 
+    def test_slack_prompt_advertises_tools_when_available(self):
+        """Slack sessions must not be told APIs are unavailable when their tools load."""
+        from unittest.mock import patch
+        import gateway.session as _gs
+
+        config = GatewayConfig(
+            platforms={
+                Platform.SLACK: PlatformConfig(enabled=True, token="fake"),
+            },
+        )
+        source = SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C123",
+            chat_name="general",
+            chat_type="group",
+            user_name="bob",
+        )
+        ctx = build_session_context(source, config)
+
+        with patch.object(_gs, "_slack_tools_loaded", return_value=True):
+            prompt = build_session_context_prompt(ctx)
+
+        assert "Slack-specific APIs are available" in prompt
+        assert "`slack_*` tools" in prompt
+        assert "You do NOT have access to Slack-specific APIs" not in prompt
+
     def test_discord_prompt_with_channel_topic(self):
         """Channel topic should appear in the session context prompt."""
         config = GatewayConfig(

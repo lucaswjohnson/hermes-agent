@@ -366,6 +366,27 @@ def _discord_tools_loaded() -> bool:
         return False
 
 
+def _slack_tools_loaded() -> bool:
+    """True iff the agent will actually have the Hermes Slack tools this session.
+
+    Slack is a plugin platform whose default platform toolset is
+    ``hermes-slack``.  An unconditional "no Slack APIs" note is therefore false
+    for an enabled Slack gateway and teaches the model to refuse actions it can
+    perform.  Keep the conservative fallback only when the token or toolset is
+    genuinely unavailable.
+    """
+    if not (os.environ.get("SLACK_BOT_TOKEN") or "").strip():
+        return False
+    try:
+        from hermes_cli.config import load_config
+        from hermes_cli.tools_config import _get_platform_tools
+        cfg = load_config()
+        enabled = _get_platform_tools(cfg, "slack", include_default_mcp_servers=False)
+        return "hermes-slack" in enabled
+    except Exception:
+        return False
+
+
 _MAX_PROMPT_METADATA_CHARS = 240
 
 
@@ -517,14 +538,25 @@ def build_session_context_prompt(
     # Platform-specific behavioral notes
     if context.source.platform == Platform.SLACK:
         lines.append("")
-        lines.append(
-            "**Platform notes:** You are running inside Slack. "
-            "You do NOT have access to Slack-specific APIs — you cannot search "
-            "channel history, pin/unpin messages, manage channels, or list users. "
-            "Do not promise to perform these actions. The gateway may inline the "
-            "current message's Slack block/attachment payload when available, but "
-            "you still cannot call Slack APIs yourself."
-        )
+        if _slack_tools_loaded():
+            lines.append(
+                "**Platform notes:** You are running inside Slack. Slack-specific APIs "
+                "are available through the session's `slack_*` tools. When the user asks "
+                "for an applicable Slack action, use the matching available tool instead "
+                "of claiming access is unavailable. Preserve the current channel/thread "
+                "as the project boundary, and report the real API result (including the "
+                "returned channel/timestamp when applicable). Do not claim a capability "
+                "that is absent from the loaded tool schema."
+            )
+        else:
+            lines.append(
+                "**Platform notes:** You are running inside Slack. "
+                "You do NOT have access to Slack-specific APIs — you cannot search "
+                "channel history, pin/unpin messages, manage channels, or list users. "
+                "Do not promise to perform these actions. The gateway may inline the "
+                "current message's Slack block/attachment payload when available, but "
+                "you still cannot call Slack APIs yourself."
+            )
     elif context.source.platform == Platform.DISCORD:
         # Inject the Discord IDs block only when the agent actually has
         # Discord tools loaded this session — i.e. the user opted into
