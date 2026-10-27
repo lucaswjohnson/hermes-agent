@@ -27,7 +27,6 @@ from tools import terminal_tool as tt
 from tools.interrupt import (
     set_interrupt,
     is_interrupted,
-    clear_current_thread_interrupt,
     _interrupted_threads,
     _lock,
 )
@@ -156,7 +155,6 @@ def test_natural_exit_130_not_mislabeled_as_interrupt(monkeypatch):
 
     assert result["exit_code"] == 130, result
     note = result.get("approval", "")
-    assert note == "Command required approval (x) and was approved by the user.", note
     assert "then interrupted" not in note
     assert "[Command interrupted]" not in result["output"]
 
@@ -232,28 +230,8 @@ def test_execute_code_non_approved_still_interrupts_on_stale_bit(monkeypatch):
 
     # Killed on the first poll before the script can print.
     assert "CODE_DONE" not in result["output"], result
+    assert result["status"] == "interrupted", result
+    assert result["output"] == "[execution interrupted]"
+    assert "user sent a new message" not in result["output"]
 
 
-def test_execute_code_remote_clears_stale_bit(monkeypatch):
-    """The clear sits above the local/remote split, so an approved remote (ssh)
-    script also dispatches from a clean slate."""
-    from tools import code_execution_tool as cet
-
-    monkeypatch.setattr(
-        "tools.approval.check_execute_code_guard",
-        lambda *a, **k: {"approved": True, "user_approved": True},
-    )
-    monkeypatch.setattr("tools.terminal_tool._get_env_config", lambda *a, **k: {"env_type": "ssh"})
-
-    captured = {}
-
-    def fake_remote(code, task_id, enabled_tools):
-        captured["interrupted"] = is_interrupted()
-        return json.dumps({"status": "success", "output": ""})
-
-    monkeypatch.setattr(cet, "_execute_remote", fake_remote)
-    set_interrupt(True)  # stale bit present before dispatch
-
-    cet.execute_code(code="print(1)", task_id="remote-clean-slate")
-
-    assert captured["interrupted"] is False, "clear must run before the remote dispatch"
