@@ -17,7 +17,7 @@ import re
 import unicodedata
 import uuid
 from types import SimpleNamespace
-from typing import Any, Dict, List, NamedTuple, Optional
+from typing import Any, Dict, List, Optional
 
 from agent.message_sanitization import deterministic_call_id
 from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
@@ -165,13 +165,6 @@ def _chat_content_to_responses_parts(content: Any, *, role: str = "user") -> Lis
     ``output_text`` inside user messages, so callers MUST pass the correct
     role for the message being converted.
 
-    Image parts are likewise role-restricted: the API only accepts
-    ``input_image`` on user-role messages. An assistant message carrying
-    ``input_image`` is rejected with HTTP 400 on every history replay, which
-    permanently bricks the session (#96816), so image parts are dropped for
-    the assistant role here (the API cannot carry them in any form, so the
-    drop is lossless w.r.t. what would survive the wire).
-
     Returns an empty list when ``content`` is not a list or contains no
     recognized parts — callers fall back to the string path.
     """
@@ -193,15 +186,6 @@ def _chat_content_to_responses_parts(content: Any, *, role: str = "user") -> Lis
                 converted.append({"type": text_type, "text": text})
             continue
         if ptype in {"image_url", "input_image"}:
-            if role == "assistant":
-                # Responses output messages cannot carry input_image. Keep a
-                # text marker so image-only assistant turns still survive in
-                # replay and later references retain their conversational slot.
-                converted.append({
-                    "type": "output_text",
-                    "text": "[Assistant image omitted during replay]",
-                })
-                continue
             image_ref = part.get("image_url")
             detail = part.get("detail")
             if isinstance(image_ref, dict):
@@ -839,50 +823,30 @@ def _chat_messages_to_responses_input(
     return prune_pre_checkpoint_items(items, item_sources=item_sources)
 
 
-class ResponsesRouteFlags(NamedTuple):
-    """Which special Responses-API route an agent is talking to.
-
-    Single owner of the codex/xai/github route predicates. Every site that
-    needs these flags (request kwargs build, preflight estimation, silent-
-    reject hints) must call :func:`classify_responses_route` instead of
-    re-implementing the string comparisons inline — inline copies drift
-    (backend-identity class: #22548/#70893/#59561/#72468).
-    """
-
-    is_codex_backend: bool
-    is_xai_responses: bool
-    is_github_responses: bool
-
-
-def classify_responses_route(agent: Any) -> ResponsesRouteFlags:
-    """Classify the agent's Responses route from provider + base URL.
-
-    Host checks are exact-host-or-subdomain (``base_url_hostname``
-    semantics), never substring matching — ``https://evil.com/models.github.ai``
-    must not classify as a GitHub route.
-    """
-    from utils import base_url_hostname
-
-    provider = getattr(agent, "provider", None)
-    base_url = str(getattr(agent, "base_url", "") or "")
+def _agent_is_codex_backend(agent: Any) -> bool:
+    if getattr(agent, "provider", None) == "openai-codex":
+        return True
     hostname = str(getattr(agent, "_base_url_hostname", "") or "").lower()
-    if not hostname:
-        hostname = base_url_hostname(base_url)
-    lower = str(getattr(agent, "_base_url_lower", "") or base_url).lower()
+    lower = str(getattr(agent, "_base_url_lower", "") or "")
+    if not lower:
+        lower = str(getattr(agent, "base_url", "") or "").lower()
+    if hostname == "chatgpt.com" and "/backend-api/codex" in lower:
+        return True
+    return "chatgpt.com" in lower and "/backend-api/codex" in lower
 
-    def _host_is(domain: str) -> bool:
-        return hostname == domain or hostname.endswith("." + domain)
 
-    is_codex_backend = provider == "openai-codex" or (
-        _host_is("chatgpt.com") and "/backend-api/codex" in lower
+def _agent_is_github_responses(agent: Any) -> bool:
+    hostname = str(getattr(agent, "_base_url_hostname", "") or "").lower()
+    lower = str(getattr(agent, "_base_url_lower", "") or getattr(agent, "base_url", "") or "").lower()
+    return hostname in {"models.github.ai", "githubcopilot.com"} or (
+        "models.github.ai" in lower or "githubcopilot.com" in lower
     )
-    is_github_responses = _host_is("models.github.ai") or _host_is("githubcopilot.com")
-    is_xai_responses = provider in {"xai", "xai-oauth"} or hostname == "api.x.ai"
-    return ResponsesRouteFlags(
-        is_codex_backend=is_codex_backend,
-        is_xai_responses=is_xai_responses,
-        is_github_responses=is_github_responses,
-    )
+
+
+def _agent_is_xai_responses(agent: Any) -> bool:
+    provider = getattr(agent, "provider", None)
+    hostname = str(getattr(agent, "_base_url_hostname", "") or "").lower()
+    return provider in {"xai", "xai-oauth"} or hostname == "api.x.ai"
 
 
 def estimate_native_responses_preflight_tokens(
@@ -908,7 +872,9 @@ def estimate_native_responses_preflight_tokens(
     if not isinstance(messages, list):
         return None
 
-    is_codex_backend, is_xai_responses, is_github_responses = classify_responses_route(agent)
+    is_codex_backend = _agent_is_codex_backend(agent)
+    is_xai_responses = _agent_is_xai_responses(agent)
+    is_github_responses = _agent_is_github_responses(agent)
 
     from agent.native_compaction import native_compaction_context_management
 
@@ -1172,14 +1138,6 @@ def _preflight_codex_input_items(
                             text = str(text or "")
                         validated.append({"type": text_type, "text": sanitize_text(text)})
                     elif ptype in {"input_image", "image_url"}:
-                        if role == "assistant":
-                            # Enforce the same output-message invariant for
-                            # raw request overrides as for normal history.
-                            validated.append({
-                                "type": "output_text",
-                                "text": "[Assistant image omitted during replay]",
-                            })
-                            continue
                         image_ref = part.get("image_url", "")
                         detail = part.get("detail")
                         if isinstance(image_ref, dict):

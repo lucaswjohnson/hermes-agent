@@ -140,17 +140,9 @@ def _connect() -> sqlite3.Connection:
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
-    from hermes_state import apply_durability_barriers
+    from hermes_state import apply_wal_with_fallback
 
-    # state.db's owning SessionDB connection establishes the configured journal
-    # mode. This secondary durability ledger must preserve that mode: applying
-    # WAL here on every short-lived connection requires an exclusive lock when
-    # the file is not already WAL and can collide with live transcript/FTS
-    # writers. The ledger works in either WAL or DELETE mode; if it opens a new
-    # file first, the default rollback journal remains valid until SessionDB
-    # establishes the configured mode. sqlite3.connect(timeout=10) above also
-    # gives its small transactions a busy handler for ordinary contention.
-    apply_durability_barriers(conn)
+    apply_wal_with_fallback(conn, db_label="state.db (async_delegation)")
     conn.execute(
         """CREATE TABLE IF NOT EXISTS async_delegations (
             delegation_id TEXT PRIMARY KEY,
@@ -708,6 +700,52 @@ def has_live_for_session(
         )
 
 
+def outstanding_for_session(
+    session_key: str = "",
+    origin_ui_session_id: str = "",
+    parent_session_id: str = "",
+) -> List[Dict[str, Any]]:
+    """Return work whose completion has not begun processing in the session."""
+    if not session_key and not origin_ui_session_id and not parent_session_id:
+        return []
+    with _records_lock:
+        return [
+            {
+                "delegation_id": str(r.get("delegation_id") or delegation_id),
+                "status": str(r.get("status") or "running"),
+                "goal": str(r.get("goal") or "delegated task"),
+                "delivery_state": str(r.get("_completion_state") or "pending"),
+            }
+            for delegation_id, r in _records.items()
+            if (
+                r.get("status") in {"running", "stalling", "finalizing"}
+                or r.get("_completion_state") in {"pending", "accepted"}
+            )
+            and _matches_session_selectors(
+                r,
+                session_key=session_key,
+                origin_ui_session_id=origin_ui_session_id,
+                parent_session_id=parent_session_id,
+            )
+        ]
+
+
+def mark_completion_accepted(delegation_id: str) -> None:
+    """Record adapter acceptance without confusing it for turn processing."""
+    with _records_lock:
+        record = _records.get(delegation_id)
+        if record is not None and record.get("_completion_state") == "pending":
+            record["_completion_state"] = "accepted"
+
+
+def mark_completion_processing(delegation_id: str) -> None:
+    """Release the final-answer guard when the completion turn actually starts."""
+    with _records_lock:
+        record = _records.get(delegation_id)
+        if record is not None:
+            record["_completion_state"] = "processing"
+
+
 def _new_delegation_id() -> str:
     return f"deleg_{uuid.uuid4().hex[:8]}"
 
@@ -721,6 +759,7 @@ def _prune_completed_locked() -> None:
         (rid, r)
         for rid, r in _records.items()
         if r.get("status") != "running"
+        and r.get("_completion_state") not in {"pending", "accepted"}
     ]
     if len(completed) <= _MAX_RETAINED_COMPLETED:
         return
@@ -831,6 +870,7 @@ def dispatch_async_delegation(
         "parent_session_id": parent_session_id,
         **_capture_routing_origin(),
         "status": "running",
+        "_completion_state": "running",
         "dispatched_at": dispatched_at,
         "completed_at": None,
         "interrupt_fn": interrupt_fn,
@@ -942,6 +982,7 @@ def _finish_finalization(delegation_id: str, status: str) -> None:
         record = _records.get(delegation_id)
         if record is not None:
             record["status"] = status
+            record["_completion_state"] = "pending"
         _prune_completed_locked()
 
 
@@ -1033,6 +1074,7 @@ def dispatch_async_delegation_batch(
     origin_ui_session_id: str = "",
     origin_session_id: str = "",
     interrupt_fn: Optional[Callable[[], None]] = None,
+    steer_fn: Optional[Callable[[str], bool]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     delegation_id: Optional[str] = None,
     progress_fn: Optional[Callable[[], tuple]] = None,
@@ -1078,9 +1120,11 @@ def dispatch_async_delegation_batch(
         "parent_session_id": parent_session_id,
         **_capture_routing_origin(),
         "status": "running",
+        "_completion_state": "running",
         "dispatched_at": dispatched_at,
         "completed_at": None,
         "interrupt_fn": interrupt_fn,
+        "steer_fn": steer_fn,
         "is_batch": True,
         "progress_fn": progress_fn,
         "_progress_token": None,
@@ -1468,7 +1512,7 @@ def list_async_delegations() -> List[Dict[str, Any]]:
             item = {
                 k: v
                 for k, v in r.items()
-                if k not in {"interrupt_fn", "progress_fn"}
+                if k not in {"interrupt_fn", "steer_fn", "progress_fn"}
                 and not k.startswith("_")
             }
             status = r.get("status")
@@ -1505,6 +1549,64 @@ def list_async_delegations() -> List[Dict[str, Any]]:
             item["children_activity"] = activity
         item["in_tool"] = bool(in_tool)
     return items
+
+
+def steer_delegation(
+    delegation_id: str,
+    instruction: str,
+    *,
+    session_key: str = "",
+    parent_session_id: str = "",
+) -> Dict[str, Any]:
+    """Append guidance to one already-running, single-worker delegation.
+
+    Ownership is mandatory and checked against the dispatch record. The
+    callback is invoked outside the registry lock and can only call the live
+    child's existing ``AIAgent.steer`` mechanism. It cannot create, replace,
+    stop, or duplicate a worker.
+    """
+    delegation_id = str(delegation_id or "").strip()
+    instruction = str(instruction or "").strip()
+    if not delegation_id or not instruction:
+        return {"ok": False, "error": "delegation_id and instruction are required"}
+    if len(instruction) > 12000:
+        return {"ok": False, "error": "instruction exceeds 12000 characters"}
+    if not session_key and not parent_session_id:
+        return {"ok": False, "error": "missing delegation owner identity"}
+    with _records_lock:
+        record = _records.get(delegation_id)
+        if record is None:
+            return {"ok": False, "error": "delegation not found"}
+        if record.get("status") not in ("running", "stalling"):
+            return {"ok": False, "error": f"delegation is {record.get('status')}"}
+        owned = bool(
+            (session_key and record.get("session_key") == session_key)
+            or (
+                parent_session_id
+                and record.get("parent_session_id") == parent_session_id
+            )
+        )
+        if not owned:
+            return {"ok": False, "error": "delegation belongs to another session"}
+        callback = record.get("steer_fn")
+    if not callable(callback):
+        return {
+            "ok": False,
+            "error": "delegation is not a steerable single-worker unit",
+        }
+    try:
+        accepted = bool(callback(instruction))
+    except Exception as exc:
+        logger.warning("steer_delegation(%s) failed: %s", delegation_id, exc)
+        return {"ok": False, "error": f"steer failed: {exc}"}
+    if not accepted:
+        return {"ok": False, "error": "worker rejected the instruction"}
+    return {
+        "ok": True,
+        "delegation_id": delegation_id,
+        "delivered": True,
+        "note": "guidance queued for the same worker after its current tool call",
+    }
 
 
 def interrupt_all(reason: str = "shutdown") -> int:
