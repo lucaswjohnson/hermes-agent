@@ -127,6 +127,20 @@ _SLACK_SPECIAL_MENTION_RE = re.compile(
     r"<!(?:everyone|channel|here)(?:\|[^>\n]*)?>", re.IGNORECASE
 )
 
+_INTERNAL_CITATION_RE = re.compile(
+    r"\ue200cite(?:\ue202[^\ue201\n]+)+\ue201"
+    r"|\ue200cite(?:(?::[a-z][a-z0-9_+-]*)|(?::turn\d+[a-z]+\d+))+:",
+    re.IGNORECASE,
+)
+
+
+def _strip_internal_citations(text: str) -> str:
+    """Remove model-native citation markers that Slack cannot render."""
+    if not text or "\ue200cite" not in text:
+        return text
+    text = _INTERNAL_CITATION_RE.sub("", text)
+    return re.sub(r"[ \t]+(?=\n|$)", "", text)
+
 # Cap on how many thread-root images are downloaded and delivered when the
 # bot is mentioned mid-thread (cold-start hydrate). Prior thread messages'
 # attachments are surfaced as text markers only — the root is special
@@ -4040,6 +4054,7 @@ class SlackAdapter(BasePlatformAdapter):
         when Slack rejects the payload (e.g. a surface without ``markdown``
         block support).
         """
+        content = _strip_internal_citations(content)
         if self._markdown_blocks_enabled():
             md_blocks = self._markdown_block_payload(content)
             if md_blocks:
@@ -4069,6 +4084,7 @@ class SlackAdapter(BasePlatformAdapter):
         if not content:
             return content
 
+        content = _strip_internal_citations(content)
         content = _wrap_markdown_tables(content)
 
         placeholders: dict = {}

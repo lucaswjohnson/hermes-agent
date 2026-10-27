@@ -2263,6 +2263,21 @@ class TestFormatMessage:
     """Test markdown to Slack mrkdwn conversion."""
 
 
+    def test_malformed_internal_citation_marker_is_removed(self, adapter):
+        text = (
+            "Not available through the API. "
+            "\ue200cite:ship:turn0search0:ship:turn0search1:walking:\n"
+            "Next paragraph."
+        )
+        assert adapter.format_message(text) == (
+            "Not available through the API.\nNext paragraph."
+        )
+
+    def test_canonical_internal_citation_marker_is_removed(self, adapter):
+        text = "Supported by Meta. \ue200cite\ue202turn0search0\ue202turn0search1\ue201"
+        assert adapter.format_message(text) == "Supported by Meta."
+
+
     def test_italic_asterisk_conversion(self, adapter):
         assert adapter.format_message("*hello*") == "_hello_"
 

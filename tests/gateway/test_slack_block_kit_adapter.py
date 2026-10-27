@@ -157,6 +157,21 @@ class TestMarkdownBlockMode:
     native ``markdown`` block, keeping the mrkdwn ``text`` fallback."""
 
     @pytest.mark.asyncio
+    async def test_internal_citation_marker_removed_from_block_and_fallback(self):
+        adapter, client = _make_adapter({"markdown_blocks": True})
+        content = (
+            "# Answer\n\nSupported by Meta. "
+            "\ue200cite:ship:turn6search0:ship:turn0search1:walking:"
+        )
+
+        await adapter.send("C1", content)
+
+        kwargs = client.chat_postMessage.await_args.kwargs
+        assert "\ue200cite" not in kwargs["text"]
+        assert "\ue200cite" not in kwargs["blocks"][0]["text"]
+        assert kwargs["blocks"][0]["text"] == "# Answer\n\nSupported by Meta."
+
+    @pytest.mark.asyncio
     async def test_disabled_by_default(self):
         adapter, client = _make_adapter()
         await adapter.send("C1", RICH_TABLE_MD)
