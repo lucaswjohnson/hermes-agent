@@ -38,6 +38,12 @@ _write_origin: contextvars.ContextVar[str] = contextvars.ContextVar(
     "skill_write_origin",
     default="foreground",
 )
+_background_review_allowed_skills: contextvars.ContextVar[frozenset[str]] = (
+    contextvars.ContextVar(
+        "background_review_allowed_skills",
+        default=frozenset(),
+    )
+)
 
 # The sentinel value the background review fork uses; mirrors
 # run_agent.py's AIAgent._memory_write_origin override in
@@ -76,3 +82,25 @@ def is_background_review() -> bool:
     """Convenience: True iff the current write origin is the background
     review fork."""
     return get_current_write_origin() == BACKGROUND_REVIEW
+
+
+def set_background_review_allowed_skills(
+    names: set[str] | frozenset[str],
+) -> contextvars.Token[frozenset[str]]:
+    """Bind existing-skill targets proven to be in the foreground task."""
+    normalized = frozenset(
+        str(name).strip() for name in names if str(name).strip()
+    )
+    return _background_review_allowed_skills.set(normalized)
+
+
+def reset_background_review_allowed_skills(
+    token: contextvars.Token[frozenset[str]],
+) -> None:
+    """Restore the previous background-review target scope."""
+    _background_review_allowed_skills.reset(token)
+
+
+def get_background_review_allowed_skills() -> frozenset[str]:
+    """Return existing skills eligible for a background proposal."""
+    return _background_review_allowed_skills.get()

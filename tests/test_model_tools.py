@@ -39,6 +39,14 @@ class TestHandleFunctionCall:
         assert len(parsed["error"]) > 0
         assert "error" in parsed["error"].lower() or "failed" in parsed["error"].lower()
 
+    def test_dispatch_forwards_context_id(self):
+        with patch("model_tools.registry.dispatch", return_value='{"ok":true}') as dispatch:
+            result = handle_function_call(
+                "web_search", {"q": "test"}, context_id="session-1:7"
+            )
+        assert result == '{"ok":true}'
+        assert dispatch.call_args.kwargs["context_id"] == "session-1:7"
+
     def test_tool_hooks_receive_session_and_tool_call_ids(self):
         with (
             patch("model_tools.registry.dispatch", return_value='{"ok":true}'),

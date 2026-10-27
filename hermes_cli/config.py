@@ -2425,6 +2425,18 @@ DEFAULT_CONFIG = {
         #                     never crammed into a chat bubble), apply with
         #                     /skills approve <id> or drop with /skills reject <id>.
         "write_approval": False,
+        # Autonomous post-turn skill review has a separate, fail-safe policy.
+        # It never inherits direct-write authority merely because the general
+        # foreground approval gate is disabled.
+        #   stage (default) — write a proposal outside the live skill store
+        #   off             — disable autonomous skill proposals
+        #   direct          — historical behavior; still obeys write_approval
+        "background_review_write_mode": "stage",
+        # Skip the review before any model/tool work when persistent storage
+        # cannot safely hold its trace and staged proposal. The byte floor is
+        # portable; operators may add a stricter percentage floor.
+        "background_review_min_free_bytes": 1_073_741_824,
+        "background_review_min_free_percent": 0.0,
     },
 
     # Curator — background skill maintenance.

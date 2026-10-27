@@ -7,7 +7,9 @@ from unittest.mock import patch
 
 import pytest
 
+import tools.skill_manager_tool as skill_manager_module
 from tools.skill_manager_tool import (
+    _background_review_scope_guard as actual_background_review_scope_guard,
     _validate_name,
     _validate_category,
     _validate_frontmatter,
@@ -21,6 +23,21 @@ from tools.skill_manager_tool import (
     skill_manage,
     MAX_NAME_LENGTH,
 )
+
+
+@pytest.fixture(autouse=True)
+def _legacy_direct_background_review_policy(monkeypatch):
+    """Keep legacy mutation tests explicit while new tests cover safe mode."""
+    monkeypatch.setattr(
+        skill_manager_module,
+        "_background_review_write_mode",
+        lambda: "direct",
+    )
+    monkeypatch.setattr(
+        skill_manager_module,
+        "_background_review_scope_guard",
+        lambda _action, _name: None,
+    )
 
 
 @contextmanager
@@ -53,6 +70,109 @@ description: Updated description.
 
 Step 1: Do the new thing.
 """
+
+
+class TestBackgroundReviewPolicy:
+    def test_background_review_gate_import_failure_fails_closed(self):
+        from tools.skill_provenance import (
+            BACKGROUND_REVIEW,
+            reset_current_write_origin,
+            set_current_write_origin,
+        )
+
+        origin = set_current_write_origin(BACKGROUND_REVIEW)
+        try:
+            with patch(
+                "tools.skill_manager_tool._load_write_approval_module",
+                side_effect=ImportError("unavailable"),
+            ):
+                result = json.loads(
+                    skill_manager_module._apply_skill_write_gate(
+                        "create",
+                        "test-skill",
+                        description="test",
+                        content=VALID_SKILL_CONTENT,
+                    )
+                )
+        finally:
+            reset_current_write_origin(origin)
+
+        assert result["success"] is False
+        assert "refusing the background review write" in result["error"]
+
+    def test_background_review_stages_even_when_general_approval_is_off(
+        self, tmp_path
+    ):
+        from tools.skill_provenance import (
+            BACKGROUND_REVIEW,
+            reset_background_review_allowed_skills,
+            reset_current_write_origin,
+            set_background_review_allowed_skills,
+            set_current_write_origin,
+        )
+
+        with _skill_dir(tmp_path):
+            _create_skill("test-skill", VALID_SKILL_CONTENT, None)
+            origin = set_current_write_origin(BACKGROUND_REVIEW)
+            scope = set_background_review_allowed_skills({"test-skill"})
+            try:
+                with (
+                    patch(
+                        "tools.skill_manager_tool._background_review_write_mode",
+                        return_value="stage",
+                    ),
+                    patch("tools.write_approval.evaluate_gate") as gate,
+                    patch("tools.write_approval.stage_write") as stage,
+                ):
+                    gate.return_value.allow = True
+                    gate.return_value.blocked = False
+                    gate.return_value.stage = False
+                    stage.return_value = {"id": "proposal-1"}
+                    result = json.loads(
+                        skill_manage(
+                            "patch",
+                            "test-skill",
+                            old_string="Step 1",
+                            new_string="Step one",
+                        )
+                    )
+            finally:
+                reset_background_review_allowed_skills(scope)
+                reset_current_write_origin(origin)
+
+        assert result["staged"] is True
+        assert result["pending_id"] == "proposal-1"
+        assert stage.call_args.kwargs["origin"] == BACKGROUND_REVIEW
+        assert stage.call_args.args[1]["_proposal_policy"] == {
+            "write_mode": "stage",
+            "allowed_skills": ["test-skill"],
+            "requires_validation": True,
+        }
+
+    def test_background_review_cannot_expand_scope_by_discovery(self, tmp_path):
+        from tools.skill_provenance import (
+            BACKGROUND_REVIEW,
+            reset_background_review_allowed_skills,
+            reset_current_write_origin,
+            set_background_review_allowed_skills,
+            set_current_write_origin,
+        )
+
+        origin = set_current_write_origin(BACKGROUND_REVIEW)
+        scope = set_background_review_allowed_skills({"different-skill"})
+        try:
+            result = actual_background_review_scope_guard(
+                "patch",
+                "test-skill",
+            )
+        finally:
+            reset_background_review_allowed_skills(scope)
+            reset_current_write_origin(origin)
+
+        assert result is not None
+        assert result["success"] is False
+        assert result["_scope_blocked"] is True
+        assert result["allowed_skills"] == ["different-skill"]
 
 
 # ---------------------------------------------------------------------------
